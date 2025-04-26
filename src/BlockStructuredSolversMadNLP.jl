@@ -2,7 +2,7 @@ module BlockStructuredSolversMadNLP
 
 using MadNLP
 
-import CUDA: CuMatrix, CuArray, CuVector, @cuda
+import CUDA: CuVector, @cuda, blockIdx, blockDim, threadIdx, cld, zeros
 import CUDA.CUSPARSE: CuSparseMatrixCSC
 import BlockStructuredSolvers: BlockTriDiagData, factorize!, solve!
 
@@ -188,8 +188,8 @@ function split_block_tridiag(A::CuSparseMatrixCSC{Tv,Ti}, b::Integer) where {Tv,
     valB = nzval[maskL]
 
     # ---- scatter on the GPU (broadcast assignment = race-free) ------------
-    vecD = CUDA.zeros(Tv, b*b*nb)
-    vecB = CUDA.zeros(Tv, b*b*(nb-1))
+    vecD = zeros(Tv, b*b*nb)
+    vecB = zeros(Tv, b*b*(nb-1))
     vecD[idxD] .= valD
     vecB[idxB] .= valB
 
