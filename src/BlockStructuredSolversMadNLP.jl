@@ -5,7 +5,7 @@ using MadNLP
 import CUDA: CuVector, @cuda, blockIdx, blockDim, threadIdx, cld, CUDABackend
 import CUDA.CUSPARSE: CuSparseMatrixCSC
 import BlockStructuredSolvers: BlockTriDiagData, initialize, factorize!, solve!
-import KernelAbstractions: @kernel, @index, synchronize
+import KernelAbstractions: @kernel, @index, @Const, synchronize
 
 export split_block_tridiag, TBDSolver, TBDSolverOptions
 
@@ -46,11 +46,11 @@ end
 
 function MadNLP.factorize!(solver::TBDSolver{T}) where T
 
-    # @time split_block_tridiag(solver.inner.A_vec, solver.inner.B_vec, solver.tril, solver.inner.n)
-    memcopy!(CUDABackend())(solver.inner.A_vec, solver.tril.nzVal, solver.dstD, solver.srcD; ndrange=length(solver.dstD))
-    memcopy!(CUDABackend())(solver.inner.B_vec, solver.tril.nzVal, solver.dstB, solver.srcB; ndrange=length(solver.dstB))
+    copyto!(solver.inner.A_vec, solver.inner.A_fill)
+    memcopy!(CUDABackend())(solver.inner.A_vec, solver.tril.nzVal, solver.dstD, solver.srcD; ndrange=solver.lenD)
+    memcopy!(CUDABackend())(solver.inner.B_vec, solver.tril.nzVal, solver.dstB, solver.srcB; ndrange=solver.lenB)
     synchronize(CUDABackend())
-    solver.inner.A_vec[solver.padIdx] .= one(T)
+
     factorize!(solver.inner)
 
     return solver
@@ -186,9 +186,6 @@ function make_maps(A::CuSparseMatrixCSC{Tv,Ti}, b::Integer) where {Tv,Ti<:Intege
     dstB = lc[low] .+ lr[low] .* bTi .+ bc[low] .* b2Ti .+ 1
     srcB = nzids[low]
 
-    lenD = b*b*nb
-    lenB = b*b*(nb-1)
-
     # --- padding indices for identity in last block ------------------------
     s = n - (nb-1)*b                              # physical size of last block
     if s == b
@@ -198,10 +195,10 @@ function make_maps(A::CuSparseMatrixCSC{Tv,Ti}, b::Integer) where {Tv,Ti<:Intege
         padIdx = (kvec .+ kvec .* bTi) .+ Ti(nb-1)*b2Ti .+ 1
     end
 
-    return dstD, srcD, dstB, srcB, padIdx, lenD, lenB
+    return dstD, srcD, dstB, srcB, padIdx, length(dstD), length(dstB)
 end
 
-@kernel function memcopy!(out, nzval, dst, src)
+@kernel function memcopy!(out, @Const(nzval), @Const(dst), @Const(src))
     k = @index(Global)
     @inbounds out[dst[k]] = nzval[src[k]]
 end
