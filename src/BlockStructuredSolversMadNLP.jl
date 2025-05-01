@@ -2,9 +2,10 @@ module BlockStructuredSolversMadNLP
 
 using MadNLP
 
-import CUDA: CuVector, @cuda, blockIdx, blockDim, threadIdx, cld
+import CUDA: CuVector, @cuda, blockIdx, blockDim, threadIdx, cld, CUDABackend
 import CUDA.CUSPARSE: CuSparseMatrixCSC
 import BlockStructuredSolvers: BlockTriDiagData, initialize, factorize!, solve!
+import KernelAbstractions: @kernel, @index, synchronize
 
 export split_block_tridiag, TBDSolver, TBDSolverOptions
 
@@ -18,6 +19,14 @@ mutable struct TBDSolver{T} <: MadNLP.AbstractLinearSolver{T}
 
     opt::MadNLP.AbstractOptions
     logger::MadNLP.MadNLPLogger
+
+    dstD::CuVector
+    srcD::CuVector
+    dstB::CuVector
+    srcB::CuVector
+    padIdx::CuVector
+    lenD::Int
+    lenB::Int
 end
 
 function TBDSolver(
@@ -29,17 +38,19 @@ function TBDSolver(
     #TODO ordering
     N, n = detect_spaces_and_divide_csc(csc)
     println("N, n = ", N, ", ", n)
-    # N = 50
-    # n = 2
     solver = initialize(N, n, eltype(csc), true)
+    dstD, srcD, dstB, srcB, padIdx, lenD, lenB = make_maps(csc, n)
 
-    return TBDSolver(solver, csc, opt, logger)
+    return TBDSolver(solver, csc, opt, logger, dstD, srcD, dstB, srcB, padIdx, lenD, lenB)
 end
 
 function MadNLP.factorize!(solver::TBDSolver{T}) where T
 
-    split_block_tridiag(solver.inner.A_vec, solver.inner.B_vec, solver.tril, solver.inner.n)
-    
+    # @time split_block_tridiag(solver.inner.A_vec, solver.inner.B_vec, solver.tril, solver.inner.n)
+    memcopy!(CUDABackend())(solver.inner.A_vec, solver.tril.nzVal, solver.dstD, solver.srcD; ndrange=length(solver.dstD))
+    memcopy!(CUDABackend())(solver.inner.B_vec, solver.tril.nzVal, solver.dstB, solver.srcB; ndrange=length(solver.dstB))
+    synchronize(CUDABackend())
+    solver.inner.A_vec[solver.padIdx] .= one(T)
     factorize!(solver.inner)
 
     return solver
@@ -120,89 +131,79 @@ function detect_spaces_and_divide_csc(csc_matrix::CuSparseMatrixCSC{T}) where T
     return ceil(Int, num_rows / max(1, result)), max(1, result)
 end
 
-# ─────────────────────────  kernel: colPtr → colIdx  ──────────────────────
-function k_expand!(colIdx, colPtr, ncol::Int32)
-    j0 = (blockIdx().x - 1) * blockDim().x + threadIdx().x - 1   # 0-based col
+# ------------------------------------------------------------------
+# kernel: colPtr → colIdx   (values 1-based)
+# ------------------------------------------------------------------
+function k_expand!(idx, ptr, ncol::Int32)
+    j0 = (blockIdx().x-1)*blockDim().x + threadIdx().x - 1        # 0-based col
     if j0 < ncol
-        first = colPtr[Int32(j0 + 1)]
-        last  = colPtr[Int32(j0 + 2)] - 1
-        pos   = first
-        @inbounds while pos ≤ last
-            colIdx[pos] = j0 + 1        # store 1-based column number
-            pos += 1
+        f = ptr[j0+1];  l = ptr[j0+2] - 1
+        while f ≤ l
+            @inbounds idx[f] = j0 + 1                             # 1-based col
+            f += 1
         end
     end
-    return
 end
 
 _expand(ptr, nnz, ncol) = begin
     idx = CuVector{eltype(ptr)}(undef, nnz)
     @cuda threads=128 blocks=cld(ncol,128) k_expand!(idx, ptr, Int32(ncol))
-    idx                            # 1-based column numbers
+    idx
 end
 
-# ─────────────────────────  main extractor  ───────────────────────────────
-"""
-    D, B = split_block_tridiag(A_gpu, b)
+# ------------------------------------------------------------------
+# build GPU index vectors
+# ------------------------------------------------------------------
+function make_maps(A::CuSparseMatrixCSC{Tv,Ti}, b::Integer) where {Tv,Ti<:Integer}
+    n      = size(A,1)
+    nb     = cld(n, b)                         # ceil(n/b)  – ragged last blk OK
+    nnz    = length(A.nzVal)
+    bTi    = Ti(b);   b2Ti = bTi*bTi
+    row1   = A.rowVal
+    col1   = _expand(A.colPtr, nnz, size(A,2))
+    nzids  = CuVector(Ti.(1:nnz))              # 1…nnz on GPU
 
-* `A_gpu` — cuSPARSE CSC storing **only the lower triangle** of a symmetric
-  block-tridiagonal matrix.
-* `b`     — block size.
-
-Returns  
-
-* `D[b,b,nb]`   — full diagonal blocks (last padded with identity if needed)  
-* `B[b,b,nb-1]` — **upper** off-diagonal blocks (already transposed)
-"""
-function split_block_tridiag(vecD, vecB, A::CuSparseMatrixCSC{Tv,Ti}, b::Integer) where {Tv,Ti<:Integer}
-    n    = size(A,1)
-    nb   = cld(n, b)                       # ceil division
-    nnz  = length(A.nzVal)
-    ncol = size(A,2)
-    bTi  = Ti(b);   b2Ti = bTi*bTi
-
-    # 1. raw buffers on GPU (1-based)
-    row1   = A.rowVal    
-    colPtr = A.colPtr
-    col1   = _expand(colPtr, nnz, ncol)
-    nzval  = A.nzVal                       # already CuArray
-
-    # 2. 0-based temporaries
+    # 0-based temporaries
     row0 = row1 .- one(Ti)
     col0 = col1 .- one(Ti)
-
-    br  = row0 .÷ bTi;   lr = row0 .% bTi   # block row / local row
-    bc  = col0 .÷ bTi;   lc = col0 .% bTi   # block col / local col
-    lin = lr .+ lc .* bTi                   # 0-based index in b×b
+    br   = row0 .÷ bTi;  lr = row0 .% bTi
+    bc   = col0 .÷ bTi;  lc = col0 .% bTi
+    lin  = lr .+ lc .* bTi
 
     diag = br .== bc
     low  = br .== bc .+ one(Ti)
 
-    # -------- indices & values for D (duplicate upper part) -----------------
-    idx_lo = lin[diag] .+ br[diag] .* b2Ti .+ 1
-    idx_up = lc[diag] .+ lr[diag] .* bTi .+ br[diag] .* b2Ti .+ 1
-    valD   = nzval[diag]
+    # --- D (full diagonal blocks) ------------------------------------------
+    dst_lo = lin[diag] .+ br[diag] .* b2Ti .+ 1
+    dst_up = lc[diag] .+ lr[diag] .* bTi .+ br[diag] .* b2Ti .+ 1
+    src_lo = nzids[diag]
 
-    unique = idx_lo .!= idx_up             # off-diagonal in block
-    idxD   = vcat(idx_lo, idx_up[unique])
-    valD   = vcat(valD,  valD[unique])
+    keep   = dst_lo .!= dst_up                     # off-diagonal in block
+    dstD   = vcat(dst_lo, dst_up[keep])
+    srcD   = vcat(src_lo, src_lo[keep])            # same value for upper copy
 
-    # -------- indices & values for B (already upper) ------------------------
-    idxB = lc[low] .+ lr[low] .* bTi .+ bc[low] .* b2Ti .+ 1
-    valB = nzval[low]
+    # --- B (upper off-diagonal) --------------------------------------------
+    dstB = lc[low] .+ lr[low] .* bTi .+ bc[low] .* b2Ti .+ 1
+    srcB = nzids[low]
 
-    # -------- allocate & scatter (GPU broadcasts) ---------------------------
-    vecD[idxD] .= valD
-    vecB[idxB] .= valB
+    lenD = b*b*nb
+    lenB = b*b*(nb-1)
 
-    # -------- pad last diagonal block if matrix size ragged -----------------
-    s = n - (nb-1)*b                       # physical size of last block
-    if s < b
-        base   = (nb-1)*b*b + 1            # flat offset of that block
-        diagID = base .+ ((s):b .- 1) .* (b+1)
-        vecD[diagID] .= one(Tv)            # identity on padded rows/cols
+    # --- padding indices for identity in last block ------------------------
+    s = n - (nb-1)*b                              # physical size of last block
+    if s == b
+        padIdx = CuVector{Ti}(undef, 0)           # nothing to pad
+    else
+        kvec   = CuVector(Ti.(s:b-1))             # missing local rows/cols
+        padIdx = (kvec .+ kvec .* bTi) .+ Ti(nb-1)*b2Ti .+ 1
     end
 
+    return dstD, srcD, dstB, srcB, padIdx, lenD, lenB
+end
+
+@kernel function memcopy!(out, nzval, dst, src)
+    k = @index(Global)
+    @inbounds out[dst[k]] = nzval[src[k]]
 end
 
 

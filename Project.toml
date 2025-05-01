@@ -6,10 +6,12 @@ version = "0.1.0"
 [deps]
 BlockStructuredSolvers = "e294871a-52ed-424c-aac5-512b15cb83b5"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 MadNLP = "2621e9c9-9eb4-46b1-8089-e8c72242dfb6"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [compat]
 CUDA = "5.7.3"
+KernelAbstractions = "0.9.34"
 MadNLP = "0.8.6"
 SparseArrays = "1.11.0"
