@@ -201,7 +201,7 @@ function make_maps(A::CuSparseMatrixCSC{Tv,Ti}, b::Integer) where {Tv,Ti<:Intege
     return dstD, srcD, dstB, srcB, padIdx, lenD, lenB
 end
 
-@kernel function memcopy!(out, nzval, dst, src)
+@kernel function memcopy!(out, @Const(nzval), @Const(dst), @Const(src))
     k = @index(Global)
     @inbounds out[dst[k]] = nzval[src[k]]
 end
