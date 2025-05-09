@@ -4,7 +4,7 @@ using MadNLP
 
 import CUDA: CuVector, @cuda, blockIdx, blockDim, threadIdx, cld, CUDABackend
 import CUDA.CUSPARSE: CuSparseMatrixCSC
-import BlockStructuredSolvers: BlockTriDiagData, initialize, factorize!, solve!
+import BlockStructuredSolvers: BlockTriDiagData_batched, initialize_batched, factorize!, solve!
 import KernelAbstractions: @kernel, @index, @Const, synchronize
 
 export split_block_tridiag, TBDSolver, TBDSolverOptions
@@ -14,11 +14,14 @@ export split_block_tridiag, TBDSolver, TBDSolverOptions
 end
 
 mutable struct TBDSolver{T} <: MadNLP.AbstractLinearSolver{T}
-    inner::Union{Nothing, BlockTriDiagData}
+    inner::Union{Nothing, BlockTriDiagData_batched}
     tril::CuSparseMatrixCSC{T}
 
     opt::MadNLP.AbstractOptions
     logger::MadNLP.MadNLPLogger
+
+    block_num::Int
+    block_size::Int
 
     dstD::CuVector
     srcD::CuVector
@@ -35,18 +38,15 @@ function TBDSolver(
     logger=MadNLP.MadNLPLogger(),
     ) where T
 
-    #TODO ordering
     N, n = detect_spaces_and_divide_csc(csc)
-    println("N, n = ", N, ", ", n)
-    solver = initialize(N, n, eltype(csc), true)
+    solver = initialize_batched(N, n, eltype(csc))
     dstD, srcD, dstB, srcB, padIdx, lenD, lenB = make_maps(csc, n)
 
-    return TBDSolver(solver, csc, opt, logger, dstD, srcD, dstB, srcB, padIdx, lenD, lenB)
+    return TBDSolver(solver, csc, opt, logger, N, n, dstD, srcD, dstB, srcB, padIdx, lenD, lenB)
 end
 
 function MadNLP.factorize!(solver::TBDSolver{T}) where T
 
-    copyto!(solver.inner.A_vec, solver.inner.A_fill)
     memcopy!(CUDABackend())(solver.inner.A_vec, solver.tril.nzVal, solver.dstD, solver.srcD; ndrange=solver.lenD)
     memcopy!(CUDABackend())(solver.inner.B_vec, solver.tril.nzVal, solver.dstB, solver.srcB; ndrange=solver.lenB)
     synchronize(CUDABackend())
@@ -58,9 +58,9 @@ end
 
 function MadNLP.solve!(solver::TBDSolver{T}, d) where T
 
-    copyto!(solver.inner.d, d)
-    solve!(solver.inner, solver.inner.d_list)
-    copyto!(d, view(solver.inner.d, 1:length(d)))
+    copyto!(solver.inner.d_vec, d)
+    solve!(solver.inner)
+    copyto!(d, view(solver.inner.d_vec, 1:length(d)))
 
     return d
 end
